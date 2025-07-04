@@ -1,0 +1,645 @@
+from __future__ import annotations
+import csv
+import datetime
+import warnings
+import fluids.constants
+import matplotlib.pyplot as plt
+import numpy as np
+
+start_time = datetime.datetime.now()
+
+class Deflector:
+    def __init__(self, impingement_angle, conductivity, density,
+                 standoff_distance, cp, diameter, inlet_length, surface_area,
+                 curvature_radius = None, outlet_length=None):
+        self.impingement_angle = impingement_angle
+        self.standoff_distance = standoff_distance
+        self.conductivity = conductivity
+        self.density = density
+        self.surface_area = surface_area
+        self.cp = cp
+        self.dia = diameter
+        self.inlet = inlet_length
+        if curvature_radius is not None:
+            self.curvature = curvature_radius
+        else:
+            self.curvature = diameter
+
+        if outlet_length is not None:
+            self.outlet = outlet_length
+        else:
+            self.outlet = self.inlet
+
+    def Hotspot(self, heat_flux, time):
+        heat_flux_imperial = heat_flux * self.surface_area * 8.81643
+        density = self.density * 62.427962
+        conductivity = self.conductivity * (0.5777893165/60)
+        cp = self.cp * 2.78E-7
+
+        alpha = 2 * heat_flux_imperial * np.sqrt(time)
+        beta = np.sqrt(np.pi * density * conductivity * cp)
+        peak_temp_R = alpha / beta + 540
+        peak_temp_C = peak_temp_R * (5 / 9) - 273.15
+        return peak_temp_C
+
+    def Temp_Predict(self, heat_flux, time):
+        if not (self.impingement_angle == 10 and
+                self.standoff_distance == 0.145 and
+                self.dia == 0.127):
+            warnings.warn(
+                "Data-Based temperature model is only valid "
+                "for the test case deflector")
+        if len(heat_flux) > 4:
+            warnings.warn(
+                "Long heat flux value passed to Temp_Predict function, "
+                "intended functionality is 4 flux values for the location"
+                "of each temp sensor.")
+        heat_flux = np.multiply(heat_flux, 1e-6)  # Convert to w/mm2
+        # that the data was created from
+        if max(heat_flux) > 4 or time > 20:
+            warnings.warn(
+                "High heat flux or long burn time may make the "
+                "data-based prediction inaccurate")
+        TC1_Coeffs = [
+            time ** 2 * -0.149026848655817 + time * 2.08377049470838 + -6.97463670545437,
+            time ** 2 * 0.221765953633429 + time * 25.1710233895912 + -12.8486632144894,
+            time ** 2 * -0.0865827084693638 + time * 1.22941132509 + 15.8557275263219]
+        TC2_Coeffs = [
+            time ** 2 * -0.124364079503083 + time * 1.77572220972279 + -6.02774567430873,
+            time ** 2 * 0.202701169823531 + time * 23.0249103972411 + -7.39755011873326,
+            time ** 2 * -0.0745708016127085 + time * 1.09056122300014 + 16.2519419204681]
+        TC3_Coeffs = [
+            time ** 2 * -0.0925031958884924 + time * 1.31003556427163 + -4.43919052835322,
+            time ** 2 * 0.11527909976571 + time * 22.1062051101273 + -7.64403749166789,
+            time ** 2 * -0.0583174162257 + time * 0.858726846458673 + 17.0273079699316]
+        TC4_Coeffs = [
+            time ** 2 * -0.0632672296975038 + time * 0.914460478534484 + -3.13346010715919,
+            time ** 2 * 0.0467257436397149 + time * 19.871852759933 + -10.0209987717825,
+            time ** 2 * -0.0411590045829899 + time * 0.625592989733291 + 17.7943146211439]
+
+        a1 = [heat_flux[0] ** 2, heat_flux[0], 1]
+        a2 = [heat_flux[1] ** 2, heat_flux[1], 1]
+        a3 = [heat_flux[2] ** 2, heat_flux[2], 1]
+        a4 = [heat_flux[3] ** 2, heat_flux[3], 1]
+
+        probe_temps = [np.dot(a1, TC1_Coeffs), np.dot(a2, TC2_Coeffs),
+                       np.dot(a3, TC3_Coeffs), np.dot(a4, TC4_Coeffs)]
+        return probe_temps
+
+
+class Engine:
+    def __init__(self, combustor_temp_K, exit_dia, combustor_pressure_pa, gamma,
+                 k, viscosity, cp, massflow,
+                 throat_dia, prandtl, r_comb=None, r_ex=None,
+                 molecular_weight_c=None, molecular_weight_ex=None,
+                 throat_vel=None):
+        self.T_sg_c = combustor_temp_K
+        self.P_sg_c = combustor_pressure_pa
+        self.gamma = gamma
+        self.conductivity = k
+        self.mu = viscosity
+        self.cp = cp
+        self.r_c = r_comb
+        self.r_ex = r_ex
+        self.mw_c = molecular_weight_c
+        self.mw_ex = molecular_weight_ex
+        self.exit_dia = exit_dia
+        self.throat_dia = throat_dia
+        self.throat_vel = throat_vel
+        self.v_ex = None
+        self.a_ex = None
+        self.mdot = massflow
+        self.Pr = prandtl
+
+        if (([self.mw_c, self.mw_ex], [self.r_c, self.r_ex]) ==
+                ([None,None],[None, None])):
+            raise Exception(
+                "Definition failure, Please specifiy at least " +
+                "one molecular weight or value for R\n")
+
+        # account for single mw value
+        if self.mw_ex is None:
+            self.mw_ex = self.mw_c
+        # account for missing r values
+        if self.r_c is None:
+            self.r_c = (fluids.constants.gas_constant * 1000) / self.mw_c
+
+        if self.r_ex is None:
+            self.r_ex = (fluids.constants.gas_constant * 1000) / self.mw_ex
+
+    def Expand(self, expansion_ratio=None, expansion_pressure=None,
+               exhaust_mach=None):
+        # Nozzle properties
+        nozzle_properties = [expansion_ratio, expansion_pressure, exhaust_mach]
+        for i in range(0, len(nozzle_properties)):
+            if nozzle_properties[i] is not None:
+                nozzle_properties[i] = 1
+        if nozzle_properties.count(1) > 1:
+            if nozzle_properties[0] == 1:
+                nozzle_properties[1:] = None
+            elif nozzle_properties[1] == 1:
+                nozzle_properties[2] = None
+        if nozzle_properties == [0, 0, 0]:
+            if self.throat_dia is not None and self.throat_vel is not None:
+                area_ratio = self.exit_dia / self.throat_dia
+                Ma_ex = np.sqrt((2 / (self.gamma - 1)) * ((area_ratio ** (
+                        (self.gamma - 1) / self.gamma)) - 1))
+                stag_pressure_ratio = (1 + ((self.gamma - 1) / 2) * (
+                        Ma_ex ** 2)) ** (self.gamma / (self.gamma - 1))
+                self.Psa_ex = self.P_sg_c / stag_pressure_ratio
+                self.Tsa_e = self.T_sg_c / (
+                        1 + (((self.gamma - 1) / 2) * Ma_ex ** 2))
+                self.a_ex = np.sqrt(self.r_ex * self.Tsa_e)
+                self.v_ex = self.a_ex * Ma_ex
+            else:
+                raise Exception(
+                    "Specify nozzle properties when calling the Expand function"
+                    + ", or exit ratio during engine definition\n")
+        match nozzle_properties:
+            case [1, None, None]:
+                self.Psa_ex = expansion_ratio * 101325
+                Ma_ex = np.sqrt((((self.P_sg_c / self.Psa_ex) ** (
+                        (self.gamma - 1) / self.gamma)) - 1) * 2 / (
+                                        self.gamma - 1))
+                self.Tsa_e = self.T_sg_c / (
+                        1 + (((self.gamma - 1) / 2) * Ma_ex ** 2))
+                self.a_ex = np.sqrt(self.r_ex * self.Tsa_e)
+                self.v_ex = self.a_ex * Ma_ex
+            case [None, 1, None]:
+                self.Psa_ex = expansion_pressure
+                Ma_ex = np.sqrt((((self.P_sg_c / self.Psa_ex) ** (
+                        (self.gamma - 1) / self.gamma)) - 1) * 2 / (
+                                        self.gamma - 1))
+                self.Tsa_e = self.T_sg_c / (
+                        1 + (((self.gamma - 1) / 2) * Ma_ex ** 2))
+                self.a_ex = np.sqrt(self.r_ex * self.Tsa_e)
+                self.v_ex = self.a_ex * Ma_ex
+            case [None, None, 1]:
+                Ma_ex = exhaust_mach
+                stag_pressure_ratio = (1 + ((self.gamma - 1) / 2) * (
+                        Ma_ex ** 2)) ** (self.gamma / (self.gamma - 1))
+                self.Psa_ex = self.P_sg_c / stag_pressure_ratio
+                self.Tsa_e = self.T_sg_c / (
+                        1 + (((self.gamma - 1) / 2) * Ma_ex ** 2))
+                self.a_ex = np.sqrt(self.r_ex * self.Tsa_e)
+                self.v_ex = self.a_ex * Ma_ex
+            case _:
+                raise Exception("Please specify exhaust properties\n")
+
+    def Propagate(self, distance, plume_dia=None):
+        if self.v_ex is None:
+            raise Exception(
+                "Please use the Expand function before calling Propagate\n")
+        if distance < ((self.exit_dia / 2) / 0.053):
+            return self.v_ex
+        if plume_dia is None:
+            plume_dia = self.exit_dia
+        v_x = ((10 ** 0.79 - (33 * ((plume_dia ** 2) / distance ** 2)))
+               / (distance / plume_dia)) * self.v_ex
+        return v_x
+
+    def Deflect(self, D: Deflector):
+        standoff_distance = D.standoff_distance
+        impingement_angle = D.impingement_angle
+
+        v_impingement = self.Propagate(
+            standoff_distance)  # impingement after standoff angle,
+                                # at centre of plume
+        self.v_impingement = v_impingement
+
+        a_ex = np.sqrt(self.r_ex * self.Tsa_e)
+        mach_at_impingement = v_impingement / a_ex  # velocity change will be
+        # small, so anticipated
+        # speed of sound change is low
+
+        sigma = get_strong_weak_oblique(mach_at_impingement, impingement_angle,
+                                        self.gamma)[0]
+        # gets the weak shock angle for the impingement that's provided by the FD
+        freestream_shock_angle = 180 - (
+                90 + impingement_angle + sigma)
+        # Angle from freestream to shock normal in deg.
+        mach_normal_1 = mach_at_impingement * np.cos(np.deg2rad(
+            freestream_shock_angle))
+        # take the mach speed normal to the shock angle
+        mach_tangent = mach_at_impingement * np.sin(
+            np.deg2rad(freestream_shock_angle))
+        mach_normal_2 = np.sqrt(
+            (1 + ((self.gamma - 1) / 2) * mach_normal_1 ** 2) /
+            ((self.gamma * mach_normal_1 ** 2) - ((self.gamma - 1) / 2))
+        )  # find mach normal to shock angle after oblique shock
+
+        mach_after_impingement = np.sqrt(mach_normal_2 ** 2 + mach_tangent ** 2)
+
+        Tsa_after_oblique = self.Tsa_e * (
+                (1 + ((2 * self.gamma) / (self.gamma + 1)) * (
+                        mach_normal_1 ** 2 - 1)) *
+                ((2 + (self.gamma - 1) * mach_normal_1 ** 2) / (
+                        (self.gamma + 1) * mach_normal_1 ** 2))
+        )
+
+        speed_of_sound_after_impingement = np.sqrt(
+            self.r_ex * self.gamma * Tsa_after_oblique)
+        # speed of sound after temp change through shock
+
+        speed_along_FD = mach_after_impingement * speed_of_sound_after_impingement
+        self.V_post_shock = speed_along_FD
+        self.T_st_post_shock = Tsa_after_oblique
+
+        return
+
+
+def Temp_Surface_Conversion(D: Deflector, time, probe_Temperatures):
+    if not (D.impingement_angle == 10 and
+            D.standoff_distance == 0.145 and
+            D.dia == 0.127):
+        warnings.warn(
+            "Data-Based temperature model is only valid"
+            " for the test case deflector\n")
+    TC1_Coeffs = [
+        time ** 2 * 7.09261637335221E-15 + time * -1.38876724441972E-12 + -3.09030135958868E-12,
+        time ** 2 * 0.00472560170362053 + time * -0.154571858432344 + 2.41640356729064,
+        time ** 2 * -0.0945120080353407 + time * 3.09143654466126 + -28.3280696393145]
+    TC2_Coeffs = [
+        time ** 2 * -2.10274038265068E-12 + time * 5.09804975848031E-11 + -2.16765908380359E-10,
+        time ** 2 * 0.00264595345324568 + time * -0.0843497980285974 + 1.66532103113641,
+        time ** 2 * -0.0529193963832935 + time * 1.68700373603717 + -13.3064499357725]
+    TC3_Coeffs = [
+        time ** 2 * -1.11933104904635E-12 + time * 2.85379914652035E-11 + -1.60409044742089E-10,
+        time ** 2 * 0.00261729031216522 + time * -0.0825824117622711 + 1.62532365923783,
+        time ** 2 * -0.0523460955072181 + time * 1.65165521633515 + -12.5065083783402]
+    TC4_Coeffs = [
+        time ** 2 * 7.00963467615162E-13 + time * -2.34379496561615E-11 + 1.94274528890156E-10,
+        time ** 2 * 0.00249198956837728 + time * -0.0782763761646628 + 1.58512963481065,
+        time ** 2 * -0.0498398230613657 + time * 1.56552772525774 + -11.7025881417731]
+
+    a1 = [probe_Temperatures[0] ** 2, probe_Temperatures[0], 1]
+    a2 = [probe_Temperatures[1] ** 2, probe_Temperatures[1], 1]
+    a3 = [probe_Temperatures[2] ** 2, probe_Temperatures[2], 1]
+    a4 = [probe_Temperatures[3] ** 2, probe_Temperatures[3], 1]
+
+    surface_Temperatures = [np.dot(a1, TC1_Coeffs), np.dot(a2, TC2_Coeffs),
+                            np.dot(a3, TC3_Coeffs), np.dot(a4, TC4_Coeffs)]
+    return surface_Temperatures
+
+
+def evans_HTC(E: Engine, distance_from_impingement_m):
+    # convert all units to us customary
+    cp = E.cp * 1000 * 2.402
+    # cp BTU/ lb °F
+    conductivity = E.conductivity * 0.5781759824
+    # conductivity Btu (th) foot/ hour ft^2 °F
+    density = (E.Psa_ex * 0.062427962) / (E.r_ex * E.T_sg_c)
+    # density lb/ft3
+    viscosity = E.mu * 17.8579688
+    # dynamic viscosity lb/ in s
+    velocity = E.V_post_shock * 3.280839895
+    # velocity ft/s
+    distance_from_impingement = distance_from_impingement_m * 3.280839895
+    # distance ft
+
+    heat_transfer_coefficient_imperial = ((0.0296 *
+        (((density * velocity * distance_from_impingement) / viscosity) ** (
+                            4 / 5))* (((cp * viscosity) / conductivity) ** (
+                            1 / 3)) * conductivity)/ distance_from_impingement)
+    # heat transfer coefficient btu / in^2 sec °F
+
+    heat_transfer_coefficient_metric = (
+            heat_transfer_coefficient_imperial * 8.611128)
+    return heat_transfer_coefficient_metric
+
+
+def bartz_HFX(T_Wall, E: Engine):
+    cp = E.cp * 1000 * 0.2390057361
+    # cp BTU / lb °F
+    viscosity = E.mu * 0.000145
+    # viscocity lbf sec / in
+    throat_Dia = E.throat_dia * 39.3701
+    # throat diameter in
+    Pr = E.Pr
+    T_ex = (E.Tsa_e) * (9 / 5)
+    # exhaust temperature °R
+    T_Wall = (T_Wall) * (9 / 5)
+    # wall temperature °R
+    Ma = E.v_ex / E.a_ex
+    Cstar = ((E.P_sg_c * (
+            np.pi * (E.throat_dia / 2) ** 2)) / E.mdot) * 3.280839895
+    # C* ft/s
+    g = 32.2
+    # gravitation acceleration ft/s^2
+    PC = E.P_sg_c * 0.000145038
+    # Chamber Pressure lbf / in^2
+    gamma = E.gamma
+    exit_Dia = E.exit_dia * 39.3701
+    # Exit Diameter in
+
+    sigma = ((((T_Wall / (2 * T_ex)) * (
+            1 + ((gamma - 1) / 2 * Ma ** 2))) + 0.5) ** (-0.68) * (
+                     (1 + ((gamma - 1) / 2 * Ma ** 2)) ** (-0.12)))
+
+    T_effective = T_ex * ((1 + ((Pr ** 0.33) * ((gamma - 1) / 2 * Ma ** 2))) / (
+            1 + ((gamma - 1) / 2 * Ma ** 2)))
+
+    heat_transfer_coefficient = ((((0.026) / (throat_Dia ** 0.2)) * (
+            (viscosity ** 0.2 * cp) / (Pr ** 0.6)) *
+                          ((PC * g) / Cstar) ** 0.8) *
+                         ((((throat_Dia / 2) ** 2) * np.pi) /
+                          (((exit_Dia / 2) ** 2) * np.pi) ** 0.9) * sigma)
+    # heat transfer coefficient BTU/ in sec °F
+
+    factor = (11356.526682 / 12)
+
+    heat_flux_metric = factor * (heat_transfer_coefficient) * (
+        (T_effective - T_Wall))
+
+    return heat_flux_metric
+
+
+def eckert_HFX(T_wall, E: Engine):
+    Pr = E.Pr
+    V = E.V_post_shock
+    Cp = E.cp * 1000
+    rho = (E.Psa_ex) / (E.r_ex * E.T_sg_c)
+    mu = E.mu
+    Re = (rho * V) / mu
+    T_s = E.T_st_post_shock
+    T_tot = E.T_sg_c
+
+    Cf = 0.0296 / (Re ** (0.2))
+    # lower values, Blasius equation
+    # Cf = 0.37/((np.log10(Re))**2.53)
+    # higher values of heat flux, schlutz-grunow
+
+    r = Pr ** (1 / 3)
+    T_r = (r * (T_tot - T_s)) + T_s
+    St = (Cf / 2) * (Pr ** -(2 / 3))
+
+    h = St * (rho * Cp * V)
+    flux = h * (T_r - T_wall)
+    return flux
+
+
+def get_strong_weak_oblique(mach1, delta, gamma=1.4):
+    delta = np.deg2rad(delta)
+    # calculate coefficients
+    A = mach1 ** 2 - 1
+    B = 0.5 * (gamma + 1) * mach1 ** 4 * np.tan(delta)
+    C = (1 + 0.5 * (gamma + 1) * mach1 ** 2) * np.tan(delta)
+    coeffs = [1, C, -A, (B - A * C)]
+
+    # roots of a cubic equation, two positive solutions
+    roots = np.array([r for r in np.roots(coeffs) if r > 0])
+
+    thetas = np.arctan(1 / roots)
+    theta_weak = np.min(thetas)
+    theta_strong = np.max(thetas)
+    return [np.rad2deg(theta_weak), np.rad2deg(theta_strong)]
+
+
+def Main():
+    T_initial = 20 + 273.15  # Initial deflector temperature,K
+    total_Length = 800 / 1000  # total length to determine flux, m
+    evans_Startpoint = 2 / 1000  # start of evans approximation, m
+    step_Distance = 1 / 1000  # step setting, m
+
+    array_Length = int((total_Length) / step_Distance)
+    evans_Length = int((total_Length - evans_Startpoint) / step_Distance)
+
+    Baldrick = Engine(combustor_temp_K=1768.7,
+                      exit_dia=48.77 / 1000,
+                      combustor_pressure_pa=2000000,
+                      gamma=1.279,
+                      k=0.1307,
+                      cp=4.4775,
+                      viscosity=0.00004084,
+                      molecular_weight_c=19.4848,
+                      molecular_weight_ex=19.8018,
+                      massflow=0.75,
+                      throat_dia=24.34 / 1000,
+                      prandtl=0.5451)
+    # Values for Baldrick
+
+    Rosie = Engine(combustor_temp_K=2066.97,
+                   exit_dia=39.33 / 1000,
+                   combustor_pressure_pa=2000000,
+                   gamma=1.1279,
+                   k=0.2271,
+                   cp=1.92,
+                   viscosity=0.0000682,
+                   molecular_weight_c=20.1957,
+                   molecular_weight_ex=20.2180,
+                   massflow=0.55301,
+                   throat_dia=22.02 / 1000,
+                   prandtl=0.5542)
+
+    Test_Engine = Baldrick  # Choose which engine to use
+
+    Scale_Model = Deflector(impingement_angle=10,
+                            conductivity=45,
+                            density=7850,
+                            standoff_distance=145 / 1000,
+                            cp=540,
+                            diameter=127 / 1000,
+                            inlet_length=(100 - 57)/1000,
+                            surface_area=0.0722 + (2*0.0399),
+                            curvature_radius=63.5 /1000,
+                            outlet_length = 100/1000)
+    # Values for scale model deflector currently at Buxton
+
+    Test_Deflector = Scale_Model
+
+    Test_Engine.Expand(expansion_ratio=1)
+    Test_Engine.Deflect(Test_Deflector)
+
+    distance_spread = np.linspace(evans_Startpoint, total_Length,
+                                  evans_Length)
+
+    evans_Hs = np.zeros(np.shape(distance_spread))
+
+    for i in range(0, len(distance_spread)):
+        evans_Hs[i] = evans_HTC(Test_Engine, distance_spread[i])
+
+    bartz_Flux = bartz_HFX(T_initial, Test_Engine)
+    eckert_Flux = eckert_HFX(T_initial, Test_Engine)
+
+    evans_Fluxes = np.multiply(evans_Hs, np.sqrt(
+        (T_initial - Test_Engine.T_st_post_shock) ** 2))
+
+    valid_Output = False
+    units = ""
+    while not (valid_Output):
+        output_Type = input(
+            "Enter type of results to output, (F)lux or "
+            "(T)emperature, or (O)ther?\n").lower()
+        if output_Type == "flux" or output_Type == "f":
+            valid_Output = True
+            units = "W"
+
+            evans_Results = evans_Fluxes
+            bartz_Result = bartz_Flux
+            eckert_Result = eckert_Flux
+            Sensor_Temps = None
+        elif (output_Type == "other" or
+              output_Type == "o"):
+            while True:
+                input_other = input("Please Enter a command: \n")
+                match input_other.lower():
+                    case "help" | "h":
+                        print("Commands are: (Sensor): calculate surface "
+                              "temp from sensor values\n")
+                        # include other commands and functionallity here
+                    case "sens" | "Sensor":
+                        [time, temp1, temp2, temp3, temp4] = (
+                            input("Please input the burn time and sensor temps "
+                                  "in the format x,y,z,a,b\n").split())
+
+                        Surface_Temps = Temp_Surface_Conversion(Test_Deflector,
+                            time,[temp1, temp2,temp3, temp4])
+
+                        print("Surface temperature is " + str(
+                            Surface_Temps) + "°C\n")
+                        exit()
+                    case _:
+                        print("Please enter a command, or '(h)elp' for a "
+                              "list of commands\n")
+        elif (output_Type == "temperature" or
+              output_Type == "t" or output_Type == "temp\n"):
+            burn_Valid = False
+            while not (burn_Valid):
+                burn_Input = input(
+                    "Please enter a burn time in seconds: \n")
+                try:
+                    burn_Time = float(burn_Input)
+                    burn_Valid = True
+                except:
+                    warnings.warn("Please enter an number for burn time\n")
+                    burn_Valid = False
+            type_Chosen = False
+            while not (type_Chosen):
+                temp_Type = input(
+                    "Please enter the model to use, "
+                    "(D)ata based or (P)hysics based: \n").lower()
+                if (temp_Type == "physics" or
+                        temp_Type == "physics based" or temp_Type == "p"):
+                    valid_Output = True
+                    type_Chosen = True
+                    units = "°C"
+
+                    Sensor_Temps = None
+                    evans_Results = Test_Deflector.Hotspot(evans_Fluxes,
+                                                           burn_Time)
+                    bartz_Result = Test_Deflector.Hotspot(bartz_Flux, burn_Time)
+                    eckert_Result = Test_Deflector.Hotspot(eckert_Flux,
+                                                           burn_Time)
+
+                elif (temp_Type == "data" or
+                      temp_Type == "data based" or temp_Type == "d"):
+                    valid_Output = True
+                    type_Chosen = True
+                    units = "°C"
+
+                    Sensor_Temps = [0, 0, 0, 0]  # as sensor_temps is not None,
+                    # we can assign the fluxes later on
+                    evans_Results = evans_Fluxes
+                    bartz_Result = bartz_Flux
+                    eckert_Result = eckert_Flux
+                else:
+                    print("Invalid command.\n")
+        else:
+            print("Invalid command.\n")
+
+    # match the different flux or temp values together,
+    #                   while spotting some common issues
+    deflector_Results = np.ones(array_Length)
+
+    evans_Start_Index = int(evans_Startpoint / step_Distance)
+    deflector_Results[evans_Start_Index:(evans_Start_Index + evans_Length)] = (
+            deflector_Results[evans_Start_Index:(
+                    evans_Start_Index + evans_Length)] * evans_Results)
+
+    deflector_Results[0:evans_Start_Index + len(
+        evans_Results[evans_Results > eckert_Result])] = eckert_Result
+
+    deflector_Results[(evans_Start_Index + evans_Length) - len(
+        evans_Results[evans_Results < bartz_Result]):] = bartz_Result
+    if deflector_Results[array_Length - 1] != (
+            bartz_Result):
+        warnings.warn(
+            "Bartz result unused, length of flux "
+            " evaluation should be increased",
+            category=UserWarning)
+    if (np.average(evans_Results[0:20]) - eckert_Result) > (eckert_Result / 5):
+        warnings.warn(
+            "Large disagreement between Evans and Eckert detected, "
+            "consider changing the evaluation method of the skin friction "
+            "coefficient within the eckert_HFX function",
+            category=UserWarning)
+
+    if Sensor_Temps is not None:
+        Sensor_Temps = Test_Deflector.Temp_Predict([deflector_Results[0],
+                                    deflector_Results[int((
+                                              40 / 1000) / step_Distance)],
+                                    deflector_Results[int((
+                                              100 / 1000) / step_Distance)],
+                                    deflector_Results[int((
+                                              250 / 1000) / step_Distance)]],
+                                   burn_Time)
+
+        Surface_Temps = Temp_Surface_Conversion(Test_Deflector, burn_Time,
+                                                Sensor_Temps)
+
+        # Find the sensor temps from the flux at each location.
+        # The results arrays are always flux if data-based has been selected
+
+    distance_list = np.linspace(0, total_Length * 1000, array_Length)
+    draw_Graph = input(
+        "Draw data graph y/n? \n").lower()
+    if draw_Graph == "y":
+        if Sensor_Temps is not None:
+            fig, ax = plt.subplots()
+            deflector_Results = deflector_Results / 1000
+            ax.plot([0, 40, 100, 250], Sensor_Temps, "o")
+
+            plt.xlabel("Distance from impingement point, mm")
+            plt.ylabel("Temperature Probe Temperatures, °C")
+            plt.show()
+        else:
+            fig, ax = plt.subplots()
+            deflector_Results = deflector_Results / 1000
+            units = "kW"
+            ax.plot(distance_list, deflector_Results)
+
+            plt.xlabel("Distance from impingement point, mm")
+
+            if output_Type == "flux":
+                plt.ylabel("Heat flux on deflector, " + units)
+            else:
+                plt.ylabel("Temperature along deflector, " + units)
+
+            plt.show()
+
+    write_CSV = input(
+        "Export data as .csv y/n? \n").lower()
+    if write_CSV == "y":
+        if Sensor_Temps != None:
+            print("Sensor Temperatures are: " + str(Sensor_Temps) + "°C\n")
+            print("Surface Temperatures are: " + str(Surface_Temps) + "°C\n")
+            print(
+                "Done! in " + str(datetime.datetime.now() - start_time) + "s\n")
+            return
+        Fields = ["Distance (mm)", "Heat Flux (" + units + ")"]
+        Data = np.column_stack((distance_list, deflector_Results))
+        current_time = str(datetime.datetime.now())[:16].replace(
+            " ", "-").replace(":", "-")
+        with open(str(output_Type) + "_" + current_time +
+                  "_TestCase_.csv", "w", newline="") as f:
+            csv_writer = csv.writer(f, dialect="excel")
+            csv_writer.writerow(Fields)
+            for i in range(0, np.shape(Data)[0]):
+                csv_writer.writerow(Data[i, :])
+
+    print("Done! in " + str(datetime.datetime.now() - start_time) + "s\n")
+    exit()
+
+
+if __name__ == '__main__':
+    Main()
